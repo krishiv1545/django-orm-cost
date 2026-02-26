@@ -117,38 +117,74 @@ def track_orm_cost(view_func):
         print(f"\n{PURPLE}--- Analysis for {view_func.__name__} ---{RESET}")
         print(f"{PURPLE}Time: {total_time:.2f}ms | Queries: {len(view_queries)}{RESET}")
         
-        # 1. Exact Duplicates (Keeping your previous logic)
+        # 1. Exact Duplicates
         sql_statements = [q['sql'] for q in view_queries]
         sql_counts = Counter(sql_statements)
 
         # 2. Detailed QuerySet Analysis
-        for i, q in enumerate(view_queries, 0): # Using 0-index for correlation
+        logical_qs_count = 1
+        skip_next = False
+
+        for i in range(len(view_queries)):
+            if skip_next:
+                skip_next = False
+                continue
+
+            q = view_queries[i]
             sql = q['sql']
             
-            # Identify which objects belonged specifically to this query
+            # --- PREFETCH DETECTION LOGIC ---
+            # If there's a next query and it looks like a prefetch (contains "IN" and many IDs)
+            is_prefetch_parent = False
+            if i + 1 < len(view_queries):
+                next_sql = view_queries[i+1]['sql']
+                if " WHERE " in next_sql.upper() and " IN " in next_sql.upper():
+                    is_prefetch_parent = True
+
+            # Process Primary Query
             current_query_global_idx = start_queries + i
             instance_ids = tracker.query_to_instances.get(current_query_global_idx, set())
-            
             consumed = set()
             for inst_id in instance_ids:
                 if inst_id in tracker.used_fields:
                     consumed.update(tracker.used_fields[inst_id])
-
-            fetched = extract_fields_from_sql(sql)
             
-            # Filter consumed to only show fields that were actually in the 'fetched' list
+            fetched = extract_fields_from_sql(sql)
             actual_consumed = [f for f in consumed if f in fetched or any(f in col for col in fetched)]
 
-            print(f"\n{CYAN}{i+1}. QuerySet Analysis:{RESET}")
-            print(f"{CYAN}SQL Trace: {sql[:100]}...{RESET}")
-            print(f"{YELLOW}Fields fetched  = {fetched}{RESET}")
-            print(f"{GREEN}Fields consumed = {actual_consumed}{RESET}")
-            print(f"{PINK}Suggested QuerySet:- [Pending Logic]{RESET}")
+            # Print Header
+            print(f"\n{CYAN}{logical_qs_count}. QuerySet Analysis:{RESET}")
+            print(f"   {CYAN}SQL 1: {sql[:100]}...{RESET}")
+            print(f"   {YELLOW}Fields fetched  = {fetched}{RESET}")
+            print(f"   {GREEN}Fields consumed = {actual_consumed}{RESET}")
 
-        # 2. Summary of inefficiencies
+            # Process Prefetch Query if detected
+            if is_prefetch_parent:
+                next_q = view_queries[i+1]
+                next_sql = next_q['sql']
+                next_query_global_idx = current_query_global_idx + 1
+                
+                p_instance_ids = tracker.query_to_instances.get(next_query_global_idx, set())
+                p_consumed = set()
+                for inst_id in p_instance_ids:
+                    if inst_id in tracker.used_fields:
+                        p_consumed.update(tracker.used_fields[inst_id])
+                
+                p_fetched = extract_fields_from_sql(next_sql)
+                p_actual_consumed = [f for f in p_consumed if f in p_fetched or any(f in col for col in p_fetched)]
+
+                print(f"   {CYAN}SQL 2 (Prefetch): {next_sql[:100]}...{RESET}")
+                print(f"   {YELLOW}Prefetch Fields fetched  = {p_fetched}{RESET}")
+                print(f"   {GREEN}Prefetch Fields consumed = {p_actual_consumed}{RESET}")
+                
+                skip_next = True # Don't process this query again in the next loop iteration
+
+            print(f"   {PINK}Suggested QuerySet:- [Pending Logic]{RESET}")
+            logical_qs_count += 1
+
+        # 3. Summary of inefficiencies
         duplicates = {sql: count for sql, count in sql_counts.items() if count > 1}
         if duplicates:
-            # Your existing duplicate summary logic remains here...
             if len(duplicates) >= 1:
                  print(f"\n{ORANGE}⚠ CRITICAL: Duplicate Queries Detected{RESET}")
 
