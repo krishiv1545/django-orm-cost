@@ -45,9 +45,20 @@ By patching the `__getattribute__` method of models during the request cycle, th
 
 ## Log Analysis Guide
 
-**QuerySet Analysis** : A logical grouping of queries related to a single data request (includes Prefetches).
-**SQL Executed At** : The file and line number in your code that triggered the database hit.
- **SQL 1** : The primary query triggered by the QuerySet.
- **SQL 2 (Prefetch)** : Related data fetched via `.prefetch_related()`, grouped under its parent for clarity.
- **Fields Fetched** : The exhaustive list of columns returned by the DB.
- **Fields Consumed** : The specific fields your code actually used.
+- **QuerySet Analysis**  
+  A logical grouping of queries related to a single data request (includes prefetches).
+
+- **SQL Executed At**  
+  The file and line number in your code that triggered the database hit.
+
+- **SQL 1**  
+  The primary query triggered by the QuerySet.
+
+- **SQL 2 (Prefetch)**  
+  Related data fetched via `.prefetch_related()`, grouped under its parent for clarity.
+
+- **Fields Fetched**  
+  The exhaustive list of columns returned by the DB.
+
+- **Fields Consumed**  
+  The specific fields your code actually used.
