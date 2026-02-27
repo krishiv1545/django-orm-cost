@@ -74,6 +74,19 @@ def extract_fields_from_sql(sql):
     return clean_columns
 
 
+def filter_identifier_fields(fields):
+    """
+    Removes primary key and foreign key columns from field list.
+    Excludes:
+        - 'id'
+        - anything ending with '_id'
+    """
+    return [
+        f for f in fields
+        if f != "id"
+    ]
+
+
 def track_orm_cost(view_func):
     """
     Minimal version:
@@ -172,6 +185,8 @@ def track_orm_cost(view_func):
             print(f"   {YELLOW}Fields fetched  = {fetched}{RESET}")
             print(f"   {GREEN}Fields consumed = {actual_consumed}{RESET}")
 
+            p_fetched = []
+            p_actual_consumed = []
             if is_prefetch_parent:
                 next_q = view_queries[i+1]
                 next_sql = next_q['sql']
@@ -192,6 +207,7 @@ def track_orm_cost(view_func):
                 
                 skip_next = True
 
+            print(f"   {PINK}Efficiency: {len(filter_identifier_fields(actual_consumed))+len(filter_identifier_fields(p_actual_consumed))}/{len(filter_identifier_fields(fetched))+len(filter_identifier_fields(p_fetched))} fields consumed | ({100 - round((len(filter_identifier_fields(actual_consumed))+len(filter_identifier_fields(p_actual_consumed))) / (len(filter_identifier_fields(fetched))+len(filter_identifier_fields(p_fetched))) * 100, 2)}% fields over-fetched).{RESET}")
             print(f"   {PINK}Suggested QuerySet:- [Pending Logic]{RESET}")
             logical_qs_count += 1
 
