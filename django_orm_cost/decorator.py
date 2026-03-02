@@ -2,7 +2,6 @@ import time
 import re
 import inspect
 from functools import wraps
-from collections import Counter
 from django.test.utils import override_settings
 from django.db import connection
 from django.db.models.query import QuerySet
@@ -12,41 +11,48 @@ from django.db.models.signals import post_init
 from django.apps import apps
 
 
-PURPLE = "\033[95m"
-PINK = "\033[38;5;218m"
-CYAN = "\033[96m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-ORANGE = "\033[38;5;208m"
-RED = "\033[91m"
+BOLD = "\033[1m"
+BLUE = "\033[38;5;39m"        # Electric Blue
+SKY = "\033[38;5;117m"         # Sky Blue
+LIME = "\033[38;5;118m"        # Vivid Lime
+GOLD = "\033[38;5;220m"        # Deep Gold
+WHITE = "\033[38;5;255m"       # Pure White
+GRAY = "\033[38;5;244m"        # Dim Gray
+CRIMSON = "\033[38;5;196m"     # Warning Red
 RESET = "\033[0m"
 
 
 class FieldUsageTracker:
     def __init__(self):
-        self.used_fields = {}
-        self._patched_models = {}
-        # New: Track which query index created which instance
+        self.used_fields = {}        # instance_id -> set of paths
+        self.instance_to_path = {}   # instance_id -> path prefix
         self.query_to_instances = {} 
+        self._patched_models = {}
 
     def patch_model(self, model):
-        if model in self._patched_models:
-            return
-
+        if model in self._patched_models: return
         original_getattribute = model.__getattribute__
         tracker = self
 
         def patched_getattribute(instance, name):
+            instance_id = id(instance)
             try:
                 meta = object.__getattribute__(instance, "_meta")
-                fields = {f.name for f in meta.fields}
-            except Exception:
-                fields = set()
+                field = meta.get_field(name)
 
-            if name in fields:
-                instance_id = id(instance)
-                tracker.used_fields.setdefault(instance_id, set()).add(name)
+                # Track relationship lineage
+                if field.is_relation and not name.endswith('_id'):
+                    related_obj = original_getattribute(instance, name)
+                    if related_obj:
+                        prefix = tracker.instance_to_path.get(instance_id, "")
+                        tracker.instance_to_path[id(related_obj)] = f"{prefix}{name}__"
+                    return related_obj
 
+                # Track data usage
+                if name in {f.name for f in meta.fields}:
+                    prefix = tracker.instance_to_path.get(instance_id, "")
+                    tracker.used_fields.setdefault(instance_id, set()).add(f"{prefix}{name}")
+            except Exception: pass
             return original_getattribute(instance, name)
 
         model.__getattribute__ = patched_getattribute
@@ -74,148 +80,100 @@ def extract_fields_from_sql(sql):
     return clean_columns
 
 
-def filter_identifier_fields(fields):
-    """
-    Removes primary key and foreign key columns from field list.
-    Excludes:
-        - 'id'
-        - anything ending with '_id'
-    """
+def filter_id(fields):
     return [
         f for f in fields
-        if f != "id"
+        if f != "id" and not f.endswith("_id")
     ]
 
 
 def track_orm_cost(view_func):
-    """
-    Minimal version:
-    Logs total execution time for the decorated view.
-    """
-
     @wraps(view_func)
     def wrapper(request, *args, **kwargs):
         tracker = FieldUsageTracker()
-
         original_fetch_all = QuerySet._fetch_all
         qs_origins = {}
 
         def patched_fetch_all(self):
             stack = inspect.stack()
-            file_path = "Unknown"
-            line_no = 0
-
+            file, line = "Unknown", 0
             for frame in stack:
-                path = frame.filename
-                if "site-packages" in path or "django" in path:
-                    continue
-                file_path = path
-                line_no = frame.lineno
+                if "django" in frame.filename or "site-packages" in frame.filename: continue
+                file, line = frame.filename, frame.lineno
                 break
-
-            query_idx = len(connection.queries)
+            q_idx = len(connection.queries)
             result = original_fetch_all(self)
-            qs_origins[query_idx] = (file_path, line_no)
+            qs_origins[q_idx] = (file, line)
             return result
 
         QuerySet._fetch_all = patched_fetch_all
-
-        for model in apps.get_models():
-            tracker.patch_model(model)
-        
+        for model in apps.get_models(): tracker.patch_model(model)
         post_init.connect(tracker.record_creation)
 
         with override_settings(DEBUG=True):
             start = time.perf_counter()
             start_queries = len(connection.queries)
-
             response = view_func(request, *args, **kwargs)
-
-            end = time.perf_counter()
             end_queries = len(connection.queries)
+            total_time = (time.perf_counter() - start) * 1000
 
         post_init.disconnect(tracker.record_creation)
         tracker.unpatch_all()
         QuerySet._fetch_all = original_fetch_all
 
-        total_time = (end - start) * 1000
         view_queries = connection.queries[start_queries:end_queries]
+        print(f"\n{BOLD}{BLUE}═══ Analysis: {view_func.__name__} ═══{RESET}")
+        print(f"{BLUE}Time: {total_time:.2f}ms | Total Queries: {len(view_queries)}{RESET}")
 
-        print(f"\n{PURPLE}--- Analysis for {view_func.__name__} ---{RESET}")
-        print(f"{PURPLE}Time: {total_time:.2f}ms | Queries: {len(view_queries)}{RESET}")
-        
-        sql_statements = [q['sql'] for q in view_queries]
-        sql_counts = Counter(sql_statements)
-
-        logical_qs_count = 1
-        skip_next = False
-
+        logical_count = 1
+        skip = False
         for i in range(len(view_queries)):
-            if skip_next:
-                skip_next = False
-                continue
+            if skip: (skip := False); continue
 
             q = view_queries[i]
-            sql = q['sql']
+            global_idx = start_queries + i
+            is_prefetch = False
             
-            is_prefetch_parent = False
+            # Combine logic for prefetch pairs
             if i + 1 < len(view_queries):
-                next_sql = view_queries[i+1]['sql']
-                if " WHERE " in next_sql.upper() and " IN " in next_sql.upper():
-                    is_prefetch_parent = True
+                if " WHERE " in view_queries[i+1]['sql'].upper() and " IN " in view_queries[i+1]['sql'].upper():
+                    is_prefetch = True
 
-            current_query_global_idx = start_queries + i
-            instance_ids = tracker.query_to_instances.get(current_query_global_idx, set())
-            consumed = set()
-            for inst_id in instance_ids:
-                if inst_id in tracker.used_fields:
-                    consumed.update(tracker.used_fields[inst_id])
+            # Data Collection
+            inst_ids = tracker.query_to_instances.get(global_idx, set())
+            if is_prefetch: inst_ids.update(tracker.query_to_instances.get(global_idx + 1, set()))
             
-            fetched = extract_fields_from_sql(sql)
-            actual_consumed = [f for f in consumed if f in fetched or any(f in col for col in fetched)]
+            consumed_paths = set()
+            for obj_id in inst_ids:
+                if obj_id in tracker.used_fields: consumed_paths.update(tracker.used_fields[obj_id])
 
-            print(f"\n{CYAN}{logical_qs_count}. QuerySet Analysis:{RESET}")
+            fetched_raw = extract_fields_from_sql(q['sql'])
+            if is_prefetch: fetched_raw += extract_fields_from_sql(view_queries[i+1]['sql'])
 
-            origin = qs_origins.get(current_query_global_idx)
-            if origin:
-                file_path, line_no = origin
-                print(f"   {PINK}SQL executed at: {file_path}:{line_no}{RESET}")
+            # Efficiency Calc
+            f_clean = filter_id(fetched_raw)
+            c_clean = filter_id(consumed_paths)
+            efficiency = round((len(c_clean) / max(len(f_clean), 1)) * 100, 2)
 
-            print(f"   {CYAN}SQL 1: {sql[:100]}...{RESET}")
-            print(f"   {YELLOW}Fields fetched  = {fetched}{RESET}")
-            print(f"   {GREEN}Fields consumed = {actual_consumed}{RESET}")
+            # --- OUTPUT ---
+            print(f"\n{BOLD}{SKY}{logical_count}. QuerySet Analysis{RESET}")
+            origin = qs_origins.get(global_idx, ("Unknown", 0))
+            print(f"   {GRAY}Location: {origin[0]}:{origin[1]}{RESET}")
+            print(f"   {SKY}SQL: {q['sql'][:120]}...{RESET}")
+            
+            print(f"   {GOLD}Fields Fetched  = {f_clean}{RESET}")
+            print(f"   {LIME}Fields Consumed = {sorted(list(c_clean))}{RESET}")
 
-            p_fetched = []
-            p_actual_consumed = []
-            if is_prefetch_parent:
-                next_q = view_queries[i+1]
-                next_sql = next_q['sql']
-                next_query_global_idx = current_query_global_idx + 1
-                
-                p_instance_ids = tracker.query_to_instances.get(next_query_global_idx, set())
-                p_consumed = set()
-                for inst_id in p_instance_ids:
-                    if inst_id in tracker.used_fields:
-                        p_consumed.update(tracker.used_fields[inst_id])
-                
-                p_fetched = extract_fields_from_sql(next_sql)
-                p_actual_consumed = [f for f in p_consumed if f in p_fetched or any(f in col for col in p_fetched)]
+            eff_color = LIME if efficiency > 80 else GOLD if efficiency > 40 else CRIMSON
+            print(f"   {BOLD}{eff_color}Efficiency: {len(c_clean)}/{len(f_clean)} fields used ({100-efficiency}% over-fetched){RESET}")
+            
+            if efficiency < 100:
+                sugg = f".only({', '.join(repr(f) for f in sorted(c_clean))})"
+                print(f"   {WHITE}💡 Suggestion: {sugg}{RESET}")
 
-                print(f"   {CYAN}SQL 2 (Prefetch): {next_sql[:100]}...{RESET}")
-                print(f"   {YELLOW}Prefetch Fields fetched  = {p_fetched}{RESET}")
-                print(f"   {GREEN}Prefetch Fields consumed = {p_actual_consumed}{RESET}")
-                
-                skip_next = True
-
-            print(f"   {PINK}Efficiency: {len(filter_identifier_fields(actual_consumed))+len(filter_identifier_fields(p_actual_consumed))}/{len(filter_identifier_fields(fetched))+len(filter_identifier_fields(p_fetched))} fields consumed | ({100 - round((len(filter_identifier_fields(actual_consumed))+len(filter_identifier_fields(p_actual_consumed))) / (len(filter_identifier_fields(fetched))+len(filter_identifier_fields(p_fetched))) * 100, 2)}% fields over-fetched).{RESET}")
-            print(f"   {PINK}Suggested QuerySet:- [Pending Logic]{RESET}")
-            logical_qs_count += 1
-
-        duplicates = {sql: count for sql, count in sql_counts.items() if count > 1}
-        if duplicates:
-            if len(duplicates) >= 1:
-                 print(f"\n{ORANGE}⚠ CRITICAL: Duplicate Queries Detected{RESET}")
+            if is_prefetch: skip = True
+            logical_count += 1
+        print("")
 
         return response
-
     return wrapper
