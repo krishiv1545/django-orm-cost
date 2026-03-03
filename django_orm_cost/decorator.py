@@ -120,10 +120,29 @@ def track_orm_cost(view_func):
     @wraps(view_func)
     def wrapper(request, *args, **kwargs):
         tracker = FieldUsageTracker()
-        original_fetch_all = QuerySet._fetch_all
-        qs_origins = {}
+
+        active_queryset = None
+        queryset_groups = {}
+        queryset_order = []
+
+        def patched_iter(self):
+            nonlocal active_queryset
+
+            qs_id = id(self)
+
+            # Mark this queryset as active
+            active_queryset = qs_id
+
+            try:
+                for obj in original_iter(self):
+                    yield obj
+            finally:
+                active_queryset = None
+
 
         def patched_fetch_all(self):
+            qs_id = id(self)
+
             stack = inspect.stack()
             file, line = "Unknown", 0
             for frame in stack:
@@ -145,11 +164,32 @@ def track_orm_cost(view_func):
                 #   Line Number: 1008
                 file, line = frame.filename, frame.lineno
                 break
-            q_idx = len(connection.queries)
+
+            q_start = len(connection.queries)
             result = original_fetch_all(self)
-            qs_origins[q_idx] = (file, line)
+            q_end = len(connection.queries)
+
+            # Determine logical owner
+            owner_id = active_queryset if active_queryset else qs_id
+
+            if owner_id not in queryset_groups:
+                queryset_groups[owner_id] = {
+                    "origin": (file, line),
+                    "queries": []
+                }
+                queryset_order.append(owner_id)
+
+            for idx in range(q_start, q_end):
+                queryset_groups[owner_id]["queries"].append(idx)
+
             return result
         
+        original_fetch_all = QuerySet._fetch_all
+        original_iter = QuerySet.__iter__
+
+        QuerySet._fetch_all = patched_fetch_all
+        QuerySet.__iter__ = patched_iter
+
         QuerySet._fetch_all = patched_fetch_all
         # print(f"apps.get_models(): {apps.get_models()}")
         for model in apps.get_models():
@@ -177,60 +217,70 @@ def track_orm_cost(view_func):
         QuerySet._fetch_all = original_fetch_all
 
         view_queries = connection.queries[start_queries:end_queries]
+        
         print(f"\n{BOLD}{BLUE}═══ Analysis: {view_func.__name__} ═══{RESET}")
         print(f"{BLUE}Time: {total_time:.2f}ms | Total Queries: {len(view_queries)}{RESET}")
 
         logical_count = 1
-        skip = False
-        for i in range(len(view_queries)):
-            if skip: (skip := False); continue
+        for qs_id in queryset_order:
 
-            q = view_queries[i]
-            global_idx = start_queries + i
-            is_prefetch = False
-            
-            # Combine logic for prefetch pairs
-            if i + 1 < len(view_queries):
-                if " WHERE " in view_queries[i+1]['sql'].upper() and " IN " in view_queries[i+1]['sql'].upper():
-                    is_prefetch = True
+            group = queryset_groups[qs_id]
 
-            # Data Collection
-            inst_ids = tracker.query_to_instances.get(global_idx, set())
-            if is_prefetch: inst_ids.update(tracker.query_to_instances.get(global_idx + 1, set()))
-            
+            origin = group["origin"]
+            q_indices = [
+                idx for idx in group["queries"]
+                if start_queries <= idx < end_queries
+            ]
+
+            if not q_indices:
+                continue
+
+            all_instance_ids = set()
+            all_fetched_raw = []
+            sql_previews = []
+
+            for q_idx in q_indices:
+                local_idx = q_idx - start_queries
+                q = view_queries[local_idx]
+
+                sql_previews.append(q["sql"][:120])
+
+                inst_ids = tracker.query_to_instances.get(q_idx, set())
+                all_instance_ids.update(inst_ids)
+
+                all_fetched_raw += extract_fields_from_sql(q["sql"])
+
             consumed_paths = set()
-            for obj_id in inst_ids:
-                if obj_id in tracker.used_fields: consumed_paths.update(tracker.used_fields[obj_id])
+            for obj_id in all_instance_ids:
+                if obj_id in tracker.used_fields:
+                    consumed_paths.update(tracker.used_fields[obj_id])
 
-            fetched_raw = extract_fields_from_sql(q['sql'])
-            if is_prefetch: 
-                fetched_raw += extract_fields_from_sql(view_queries[i+1]['sql'])
-
-            # Efficiency Calc
-            f_clean = filter_id(fetched_raw)
+            f_clean = filter_id(all_fetched_raw)
             c_clean = filter_id(consumed_paths)
-            efficiency = round((len(c_clean) / max(len(f_clean), 1)) * 100, 2)
 
-            # --- OUTPUT ---
             print(f"\n{BOLD}{SKY}{logical_count}. QuerySet Analysis{RESET}")
-            origin = qs_origins.get(global_idx, ("Unknown", 0))
             print(f"   {GRAY}Location: {origin[0]}:{origin[1]}{RESET}")
-            print(f"   {SKY}SQL: {q['sql'][:120]}...{RESET}")
-            
+
+            for i, sql in enumerate(sql_previews, 1):
+                print(f"   {SKY}SQL {i}: {sql}...{RESET}")
+
             print(f"   {GOLD}Fields Fetched  = {f_clean}{RESET}")
             print(f"   {LIME}Fields Consumed = {sorted(list(c_clean))}{RESET}")
 
-            eff_color = LIME if efficiency > 80 else GOLD if efficiency > 40 else CRIMSON
-            print(f"   {BOLD}{eff_color}Efficiency: {len(c_clean)}/{len(f_clean)} fields used ({100-efficiency}% over-fetched){RESET}")
-            
-            if efficiency < 100:
+            if len(q_indices) > 1:
+                fingerprints = [
+                    re.sub(r"\b\d+\b", "?", view_queries[q_idx - start_queries]["sql"])
+                    for q_idx in q_indices
+                ]
+                if len(set(fingerprints)) < len(fingerprints):
+                    print(f"   {CRIMSON}⚠ N+1 detected inside this QuerySet{RESET}")
+
+            if c_clean:
                 sugg = f".only({', '.join(repr(f) for f in sorted(c_clean))})"
                 print(f"   {WHITE}💡 Suggestion: {sugg}{RESET}")
 
-            if is_prefetch: skip = True
             logical_count += 1
         print("")
-
         return response
     
     # Wrapper function executes Django view, collects response, and we monkey-patch the execution
