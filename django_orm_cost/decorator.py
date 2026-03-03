@@ -4,31 +4,55 @@ import inspect
 from functools import wraps
 from django.test.utils import override_settings
 from django.db import connection
+# connection is an instance of BaseDatabaseWrapper
+# if DEBUG=True, db cursor is wrapped by CursorDebugWrapper
+# everytime a SQL is executed, it adds a record to connection.queries
+# connection.queries is a list of dicts {"sql" :, "time" : }
 from django.db.models.query import QuerySet
-# connection.queries is a list of dicts {"sql" :, "time" : } executed during the request cycle
-# it is like a logbook that we can inspect to see what SQL was run and how long it took
+# Django QuerySet represents a SQL AST (Abstract Syntax Tree)
+# _fetch_all() is the method that executes the SQL and populates the QuerySet's _result_cache
+# _fetch_all():-
+# 1. Compiles Django QuerySet into raw SQL
+# 2. Executes the SQL using the database cursor
+# 3. Receives raw rows from the database
+# 4. Converts raw rows into Django model instances and stores them in _result_cache*
+# *instance is created for each DB row record
+# post_init.send(sender=Model, instance=instance) is emitted after instance creation
 from django.db.models.signals import post_init
 from django.apps import apps
 
 
 BOLD = "\033[1m"
-BLUE = "\033[38;5;39m"        # Electric Blue
+BLUE = "\033[38;5;39m"         # Dark Blue
 SKY = "\033[38;5;117m"         # Sky Blue
-LIME = "\033[38;5;118m"        # Vivid Lime
-GOLD = "\033[38;5;220m"        # Deep Gold
-WHITE = "\033[38;5;255m"       # Pure White
-GRAY = "\033[38;5;244m"        # Dim Gray
-CRIMSON = "\033[38;5;196m"     # Warning Red
+LIME = "\033[38;5;118m"        # Lime
+GOLD = "\033[38;5;220m"        # Gold
+WHITE = "\033[38;5;255m"       # White
+GRAY = "\033[38;5;244m"        # Gray
+CRIMSON = "\033[38;5;196m"     # Red
 RESET = "\033[0m"
 
 
+# FieldUsageTracker tracks instances created by SQL execution and which fields are accessed on those instances
+# It tracks 3 graphs:-
+# 1. Query Index -> Instance IDs* // from post_init signal, 
+#                                    we know which instance was created by which query (using len(connection.queries) as index)
+# 2. Instance ID* -> Accessed field Paths (e.g. "user__email") // from patched __getattribute__, 
+# 3. Instance ID* -> Relation Path-Prefix (e.g. "user__") // from patched __getattribute__, 
+#                                                           when we access a related field, we track the lineage of that relationship
+# *IDs are Python memory addresses/IDs (e.g, id(instance))
 class FieldUsageTracker:
     def __init__(self):
         self.used_fields = {}        # instance_id -> set of paths
         self.instance_to_path = {}   # instance_id -> path prefix
-        self.query_to_instances = {} 
-        self._patched_models = {}
+        self.query_to_instances = {} # query index -> set of instance_ids
+        self._patched_models = {}    # model -> original __getattribute__
 
+    # Every Python model/object has a __getattribute__ method that is called whenever we access any attribute on that object
+    # In context to Django, models are CustomUser, ContentType, etc.
+    # This function patches the __getattribute__ method of every model
+    # (original) user.username -> user.__getattribute__("username")
+    # (patched) user.username -> patched_getattribute(user, "username")
     def patch_model(self, model):
         if model in self._patched_models: return
         original_getattribute = model.__getattribute__
@@ -52,16 +76,20 @@ class FieldUsageTracker:
                 if name in {f.name for f in meta.fields}:
                     prefix = tracker.instance_to_path.get(instance_id, "")
                     tracker.used_fields.setdefault(instance_id, set()).add(f"{prefix}{name}")
-            except Exception: pass
+            except Exception: 
+                pass
+            # call original getattribute to ensure normal behavior
+            # user.username -> patched_getattribute(user, "username") // track data usage -> original_getattribute(user, "username")
             return original_getattribute(instance, name)
 
-        model.__getattribute__ = patched_getattribute
+        model.__getattribute__ = patched_getattribute # overiding getattribute of model with patched version
         self._patched_models[model] = original_getattribute
 
     def record_creation(self, sender, instance, **kwargs):
         query_idx = len(connection.queries) - 1
         self.query_to_instances.setdefault(query_idx, set()).add(id(instance))
 
+    # Undo monkey-patching to restore original __getattribute__ methods of all models that were patched
     def unpatch_all(self):
         for model, original in self._patched_models.items():
             model.__getattribute__ = original
@@ -87,6 +115,7 @@ def filter_id(fields):
     ]
 
 
+# Decorator to wrap Django view
 def track_orm_cost(view_func):
     @wraps(view_func)
     def wrapper(request, *args, **kwargs):
@@ -98,22 +127,48 @@ def track_orm_cost(view_func):
             stack = inspect.stack()
             file, line = "Unknown", 0
             for frame in stack:
-                if "django" in frame.filename or "site-packages" in frame.filename: continue
+                if "django" in frame.filename or "site-packages" in frame.filename:
+                    continue
+                # print(f"Frame: {frame}")
+                # print(f"Inspecting frame: {frame.filename}:{frame.lineno} in {frame.function}")
+                # Frame:
+                #   filename: D:\Projects\finnovate_project\fintech_project\core_APP\modules\gl_reviews\gl_reviews.py
+                #   function: get_review_trail
+                #   lineno: 1008
+                #   code context: for t in trails4:
+                #   column offset: 13
+                #   end column offset: 20
+                #
+                # Inspecting frame:
+                #   File: D:\Projects\finnovate_project\fintech_project\core_APP\modules\gl_reviews\gl_reviews.py
+                #   Function: get_review_trail
+                #   Line Number: 1008
                 file, line = frame.filename, frame.lineno
                 break
             q_idx = len(connection.queries)
             result = original_fetch_all(self)
             qs_origins[q_idx] = (file, line)
             return result
-
+        
         QuerySet._fetch_all = patched_fetch_all
-        for model in apps.get_models(): tracker.patch_model(model)
+        # print(f"apps.get_models(): {apps.get_models()}")
+        for model in apps.get_models():
+            # apps.get_models() returns all models in the Django project, we monkey-patch them to track field access
+            # [<class 'django.contrib.auth.models.CustomUser'>, <class 'django.contrib.contenttypes.models.ContentType'>, ...]
+            tracker.patch_model(model)
         post_init.connect(tracker.record_creation)
 
         with override_settings(DEBUG=True):
             start = time.perf_counter()
             start_queries = len(connection.queries)
             response = view_func(request, *args, **kwargs)
+            # print(f"qs_origins: {qs_origins}")
+            # {
+            # "2": ("D:\\Projects\\finnovate_project\\fintech_project\\core_APP\\modules\\gl_reviews\\gl_reviews.py", 993),
+            # "4": ("D:\\Projects\\finnovate_project\\fintech_project\\core_APP\\modules\\gl_reviews\\gl_reviews.py", 1008),
+            # "5": ("D:\\Projects\\finnovate_project\\fintech_project\\core_APP\\modules\\gl_reviews\\gl_reviews.py", 1008),
+            # "3": ("D:\\Projects\\finnovate_project\\fintech_project\\core_APP\\modules\\gl_reviews\\gl_reviews.py", 1008)
+            # }
             end_queries = len(connection.queries)
             total_time = (time.perf_counter() - start) * 1000
 
@@ -148,7 +203,8 @@ def track_orm_cost(view_func):
                 if obj_id in tracker.used_fields: consumed_paths.update(tracker.used_fields[obj_id])
 
             fetched_raw = extract_fields_from_sql(q['sql'])
-            if is_prefetch: fetched_raw += extract_fields_from_sql(view_queries[i+1]['sql'])
+            if is_prefetch: 
+                fetched_raw += extract_fields_from_sql(view_queries[i+1]['sql'])
 
             # Efficiency Calc
             f_clean = filter_id(fetched_raw)
@@ -176,4 +232,7 @@ def track_orm_cost(view_func):
         print("")
 
         return response
+    
+    # Wrapper function executes Django view, collects response, and we monkey-patch the execution
+    # response is returned at the end
     return wrapper

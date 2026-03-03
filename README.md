@@ -37,7 +37,13 @@ QuerySets are **lazy**; they are often defined in one place (e.g., a manager or 
 * **The Mechanism:** We patch `QuerySet._fetch_all` to capture the call stack at the moment of evaluation, filtering out Django internals to find your project's business logic.
 
 ### 3. Field Usage Tracking
-By patching the `__getattribute__` method of models during the request cycle, the tracker monitors which fields are accessed by your code after the objects are instantiated.
+By patching the `__getattribute__` method of models during the request cycle, the tracker monitors which fields are accessed by your code after the objects are instantiated. Example of monkey-patching:-
+```
+class MyClass:
+    def __getattribute__(self, name):
+        print(f"Accessing: {name}")
+        return super().__getattribute__(name)
+```
 * **Fetched:** Columns requested in the `SELECT` statement.
 * **Consumed:** Fields actually accessed by your Python logic.
 
