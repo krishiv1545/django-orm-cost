@@ -21,7 +21,7 @@ from django.db.models.query import QuerySet
 from django.db.models.signals import post_init
 from django.apps import apps
 from collections import OrderedDict # OrderedDict is a subclass of dict that remembers the order of insertion
-
+from collections import Counter # Counter is a subclass of dict that counts the occurrences of each key
 
 
 BOLD = "\033[1m"
@@ -106,7 +106,8 @@ def extract_fields_from_sql(sql):
     if not match:
         return ["*"]
     columns = match.group(1).split(',')
-    clean_columns = [col.split('.')[-1].replace('"', '').strip() for col in columns]
+    # clean_columns = [col.split('.')[-1].replace('"', '').strip() for col in columns]
+    clean_columns = [col.replace('"', '').strip() for col in columns]
     return clean_columns
 
 
@@ -115,6 +116,19 @@ def filter_id(fields):
         f for f in fields
         if f != "id" and not f.endswith("_id")
     ]
+
+
+def f_filter_id(fields):
+    f_clean = [f.split('.')[-1] for f in fields]
+    return filter_id(f_clean)
+
+
+def suggest(fetched, consumed):
+
+    if len(fetched) == len(consumed):
+        return None
+    sugg = f".only({', '.join(repr(f) for f in sorted(consumed))})"
+    return sugg
 
 
 # Decorator to wrap Django view
@@ -257,7 +271,14 @@ def track_orm_cost(view_func):
                 if obj_id in tracker.used_fields:
                     consumed_paths.update(tracker.used_fields[obj_id])
 
-            f_clean = filter_id(all_fetched_raw)
+            f_clean = f_filter_id(all_fetched_raw)
+            field_counts = Counter(f_clean)
+            pretty_fields = []
+            for field, count in field_counts.items():
+                if count > 1:
+                    pretty_fields.append(f"[{count}x] {field.split('.')[-1]}")
+                else:
+                    pretty_fields.append(field.split('.')[-1])
             c_clean = filter_id(consumed_paths)
 
             print(f"\n{BOLD}{SKY}{logical_count}. QuerySet Analysis{RESET}")
@@ -287,8 +308,9 @@ def track_orm_cost(view_func):
                 prefix = f"[{count}x] " if count > 1 else ""
                 print(f"   {SKY}SQL {i}: {prefix}{preview}...{RESET}")
 
-            print(f"   {GOLD}Fields Fetched  = {f_clean}{RESET}")
+            print(f"   {GOLD}Fields Fetched  = {pretty_fields}{RESET}")
             print(f"   {LIME}Fields Consumed = {sorted(list(c_clean))}{RESET}")
+            print(f"   {LIME}Efficiency = {len(c_clean)}/{len(pretty_fields)} | {100 - (len(c_clean) / len(pretty_fields) * 100):.2f}% over-fetched{RESET}")
 
             if len(q_indices) > 1:
                 fingerprints = [
@@ -296,11 +318,11 @@ def track_orm_cost(view_func):
                     for q_idx in q_indices
                 ]
                 if len(set(fingerprints)) < len(fingerprints):
-                    print(f"   {CRIMSON}⚠ N+1 detected inside this QuerySet{RESET}")
+                    print(f"   {CRIMSON}>>> N+1 detected inside this QuerySet{RESET}")
 
-            if c_clean:
-                sugg = f".only({', '.join(repr(f) for f in sorted(c_clean))})"
-                print(f"   {WHITE}💡 Suggestion: {sugg}{RESET}")
+            sugg = suggest(f_clean, c_clean)
+            if sugg:
+                print(f"   {WHITE}>>> Suggestion: {sugg}{RESET}")
 
             logical_count += 1
         print("")
