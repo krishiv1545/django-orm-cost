@@ -20,6 +20,8 @@ from django.db.models.query import QuerySet
 # post_init.send(sender=Model, instance=instance) is emitted after instance creation
 from django.db.models.signals import post_init
 from django.apps import apps
+from collections import OrderedDict # OrderedDict is a subclass of dict that remembers the order of insertion
+
 
 
 BOLD = "\033[1m"
@@ -261,8 +263,29 @@ def track_orm_cost(view_func):
             print(f"\n{BOLD}{SKY}{logical_count}. QuerySet Analysis{RESET}")
             print(f"   {GRAY}Location: {origin[0]}:{origin[1]}{RESET}")
 
-            for i, sql in enumerate(sql_previews, 1):
-                print(f"   {SKY}SQL {i}: {sql}...{RESET}")
+            sql_counter = OrderedDict()
+
+            for q_idx in q_indices:
+                raw_sql = view_queries[q_idx - start_queries]["sql"]
+
+                # Normalize numeric values to detect repetition
+                fingerprint = re.sub(r"\b\d+\b", "?", raw_sql)
+
+                if fingerprint not in sql_counter:
+                    sql_counter[fingerprint] = {
+                        "count": 0,
+                        "preview": raw_sql[:120]
+                    }
+
+                sql_counter[fingerprint]["count"] += 1
+
+            # Print aggregated SQLs
+            for i, (fp, data) in enumerate(sql_counter.items(), 1):
+                count = data["count"]
+                preview = data["preview"]
+
+                prefix = f"[{count}x] " if count > 1 else ""
+                print(f"   {SKY}SQL {i}: {prefix}{preview}...{RESET}")
 
             print(f"   {GOLD}Fields Fetched  = {f_clean}{RESET}")
             print(f"   {LIME}Fields Consumed = {sorted(list(c_clean))}{RESET}")
