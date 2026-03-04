@@ -177,8 +177,6 @@ def track_orm_cost(view_func):
         def patched_iter(self):
             nonlocal active_queryset
 
-            # Resolve what group_key this qs maps to
-            # We need the call-site, so re-derive it here
             stack = inspect.stack()
             file, line = "Unknown", 0
             for frame in stack:
@@ -188,6 +186,10 @@ def track_orm_cost(view_func):
                 break
 
             group_key = (file, line)
+            
+            # Set active_queryset BEFORE the group exists, just store the key
+            # patched_fetch_all will check if active_queryset is set, and if the group
+            # exists. If not yet created, it will create it then attach child queries.
             active_queryset = group_key
 
             try:
@@ -197,7 +199,6 @@ def track_orm_cost(view_func):
                 active_queryset = None
 
         def patched_fetch_all(self):
-            qs_id = id(self)
             model_name = self.model.__name__
 
             stack = inspect.stack()
@@ -226,18 +227,30 @@ def track_orm_cost(view_func):
             result = original_fetch_all(self)
             q_end = len(connection.queries)
 
-            # ── NEW: if we're inside an active iteration, attach to its group ──
-            if active_queryset is not None and active_queryset in queryset_groups:
-                parent_group = queryset_groups[active_queryset]
-                for idx in range(q_start, q_end):
-                    parent_group["queries"].append(idx)
-                    # Tag these as "child" queries so we can flag N+1 later
-                    parent_group.setdefault("child_queries", set()).add(idx)
-                return result
-            # ───────────────────────────────────────────────────────────────────
-
             group_key = (file, line)
 
+            # If inside an active iteration AND this fetch is from a DIFFERENT
+            # call site (i.e. it's a child/N+1 query), attach to parent group
+            if active_queryset is not None and active_queryset != group_key:
+                # This is a child query fired during iteration of active_queryset's loop
+                parent_key = active_queryset
+                if parent_key not in queryset_groups:
+                    # Parent group not yet created (edge case), create it now
+                    queryset_groups[parent_key] = {
+                        "origin": parent_key,
+                        "queries": [],
+                        "model": model_name,
+                        "child_queries": set()
+                    }
+                    queryset_order.append(parent_key)
+
+                parent_group = queryset_groups[parent_key]
+                for idx in range(q_start, q_end):
+                    parent_group["queries"].append(idx)
+                    parent_group["child_queries"].add(idx)
+                return result
+
+            # Normal path: this fetch is the parent QuerySet itself
             if group_key not in queryset_groups:
                 queryset_groups[group_key] = {
                     "origin": (file, line),
@@ -334,6 +347,18 @@ def track_orm_cost(view_func):
                     pretty_fields.append(field.split('.')[-1])
             c_clean = filter_id(consumed_paths)
 
+            # use unique field NAMES for both sides of the efficiency ratio
+            unique_fetched = list(field_counts.keys())                # deduplicated field names
+            unique_consumed = c_filter_id(filter_id(consumed_paths))  # deduplicated consumed
+
+            # For display, pretty_fields stays the same (shows [Nx] multipliers)
+            # But efficiency is calculated on unique field name sets
+            fetched_name_set = set(unique_fetched)
+            consumed_name_set = set(c_filter_id(c_clean))
+
+            over_fetched_count = len(fetched_name_set - consumed_name_set)
+            efficiency_pct = (over_fetched_count / len(fetched_name_set) * 100) if fetched_name_set else 0.0
+
             print(f"\n{BOLD}{SKY}{logical_count}. QuerySet Analysis{RESET}")
             print(f"   {GRAY}Location: {origin[0]}:{origin[1]}{RESET}")
 
@@ -362,11 +387,11 @@ def track_orm_cost(view_func):
                 print(f"   {SKY}SQL {i}: {prefix}{sql_ast}{RESET}")
 
             print(f"   {GOLD}Fields Fetched  = {pretty_fields}{RESET}")
-            print(f"   {LIME}Fields Consumed = {c_filter_id(c_clean)}{RESET}")
-            print(f"   {LIME}Efficiency = {len(c_filter_id(c_clean))}/{len(pretty_fields)} | {100 - (len(c_filter_id(c_clean)) / len(pretty_fields) * 100):.2f}% over-fetched{RESET}")
+            print(f"   {LIME}Fields Consumed = {sorted(consumed_name_set)}{RESET}")
+            print(f"   {LIME}Efficiency = {len(consumed_name_set)}/{len(fetched_name_set)} | {efficiency_pct:.2f}% over-fetched{RESET}")
 
             is_n1 = False
-            if len(q_indices) > 1:
+            if efficiency_pct > 0:
                 fingerprints = [
                     re.sub(r"\b\d+\b", "?", view_queries[q_idx - start_queries]["sql"])
                     for q_idx in q_indices
