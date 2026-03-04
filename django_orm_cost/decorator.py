@@ -49,6 +49,13 @@ class FieldUsageTracker:
         self.instance_to_path = {}   # instance_id -> path prefix
         self.query_to_instances = {} # query index -> set of instance_ids
         self._patched_models = {}    # model -> original __getattribute__
+        self.instance_to_model = {}  # instance_id -> model class name
+        # instance_to_model is used to detect Python memory address reuse:
+        # when a short-lived instance (e.g. GLReview from .first()) is GC'd,
+        # its address may be reused by a later instance (e.g. GLSupportingDocument).
+        # By stamping each address with the model name at creation time and
+        # overwriting on reuse, we can filter out stale/colliding instance IDs
+        # when collecting consumed fields for a given group.
 
     # Every Python model/object has a __getattribute__ method that is called whenever we access any attribute on that object
     # In context to Django, models are CustomUser, ContentType, etc.
@@ -89,7 +96,12 @@ class FieldUsageTracker:
 
     def record_creation(self, sender, instance, **kwargs):
         query_idx = len(connection.queries) - 1
-        self.query_to_instances.setdefault(query_idx, set()).add(id(instance))
+        inst_id = id(instance)
+        self.query_to_instances.setdefault(query_idx, set()).add(inst_id)
+        # Stamp this memory address with the model that currently owns it.
+        # If the address is later reused by a different model instance,
+        # this entry will be overwritten, allowing stale ID detection.
+        self.instance_to_model[inst_id] = sender.__name__
 
     # Undo monkey-patching to restore original __getattribute__ methods of all models that were patched
     def unpatch_all(self):
@@ -109,6 +121,16 @@ def extract_fields_from_sql(sql):
     # clean_columns = [col.split('.')[-1].replace('"', '').strip() for col in columns]
     clean_columns = [col.replace('"', '').strip() for col in columns]
     return clean_columns
+
+
+def normalize_sql(sql):
+    # Normalize standalone integers
+    sql = re.sub(r"\b\d+\b", "?", sql)
+    # Normalize UUIDs (hex strings with optional hyphens inside quotes)
+    sql = re.sub(r"'[0-9a-f]{8}[0-9a-f\-]{0,27}'", "'?'", sql, flags=re.IGNORECASE)
+    # Normalize any remaining quoted strings (catches other id formats)
+    sql = re.sub(r"'[^']{8,}'", "'?'", sql)
+    return sql
 
 
 def filter_id(fields):
@@ -135,7 +157,7 @@ def f_filter_id(fields):
 
 def suggest(fetched, consumed, tracker, all_instance_ids, qs_id, model_name="Model", is_n1=False):
     if not consumed:
-        return f"{model_name}.objects.none()"
+        return f"{model_name}.objects.none() // Or, it maybe used to filter another QuerySet without consuming fields (e.g. used in .filter(related__in=qs)), in which case no fields are consumed here."
 
     # 1. Categorize fields
     local_fields = sorted([f for f in consumed if "__" not in f])
@@ -332,8 +354,25 @@ def track_orm_cost(view_func):
 
                 all_fetched_raw += extract_fields_from_sql(q["sql"])
 
-            consumed_paths = set()
+            # Filter out instance IDs whose memory address has been reused by a
+            # different model (Python GC recycles addresses after short-lived .first()
+            # calls). We keep an instance if:
+            # (a) its recorded model matches this group's model, OR
+            # (b) it has a path prefix in instance_to_path, meaning it's a related
+            #     object loaded via select_related (e.g. CustomUser joined into
+            #     ResponsibilityMatrix) — these legitimately have a different model name
+            safe_instance_ids = set()
             for obj_id in all_instance_ids:
+                recorded_model = tracker.instance_to_model.get(obj_id)
+                if recorded_model == model_name:
+                    safe_instance_ids.add(obj_id)
+                    continue
+                # Keep select_related / prefetch related objects (they have a path prefix)
+                if obj_id in tracker.instance_to_path:
+                    safe_instance_ids.add(obj_id)
+
+            consumed_paths = set()
+            for obj_id in safe_instance_ids:
                 if obj_id in tracker.used_fields:
                     consumed_paths.update(tracker.used_fields[obj_id])
 
@@ -366,16 +405,6 @@ def track_orm_cost(view_func):
 
             for q_idx in q_indices:
                 raw_sql = view_queries[q_idx - start_queries]["sql"]
-
-                # Normalize numeric values to detect repetition
-                def normalize_sql(sql):
-                    # Normalize standalone integers
-                    sql = re.sub(r"\b\d+\b", "?", sql)
-                    # Normalize UUIDs (hex strings with optional hyphens inside quotes)
-                    sql = re.sub(r"'[0-9a-f]{8}[0-9a-f\-]{0,27}'", "'?'", sql, flags=re.IGNORECASE)
-                    # Normalize any remaining quoted strings (catches other id formats)
-                    sql = re.sub(r"'[^']{8,}'", "'?'", sql)
-                    return sql
                 fingerprint = normalize_sql(raw_sql)
 
                 if fingerprint not in sql_counter:
@@ -399,7 +428,7 @@ def track_orm_cost(view_func):
             print(f"   {LIME}Efficiency = {len(consumed_name_set)}/{len(fetched_name_set)} | {efficiency_pct:.2f}% over-fetched{RESET}")
 
             is_n1 = False
-            if efficiency_pct > 0:
+            if len(q_indices) > 1:
                 fingerprints = [
                     normalize_sql(view_queries[q_idx - start_queries]["sql"])
                     for q_idx in q_indices
@@ -408,8 +437,8 @@ def track_orm_cost(view_func):
                     is_n1 = True
                     print(f"   {CRIMSON}>>> N+1 detected inside this QuerySet{RESET}")
 
-            if (100 - (len(c_clean) / len(pretty_fields) * 100)) > 0:
-                sugg = suggest(f_clean, c_clean, tracker, all_instance_ids, qs_id, model_name, is_n1)
+            if efficiency_pct > 0:
+                sugg = suggest(list(fetched_name_set), list(consumed_name_set), tracker, safe_instance_ids, qs_id, model_name, is_n1)
                 if sugg:
                     print(f"   {WHITE}>>> Suggestion: {sugg}{RESET}")
 
