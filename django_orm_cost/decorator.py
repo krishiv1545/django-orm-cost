@@ -177,17 +177,24 @@ def track_orm_cost(view_func):
         def patched_iter(self):
             nonlocal active_queryset
 
-            qs_id = id(self)
+            # Resolve what group_key this qs maps to
+            # We need the call-site, so re-derive it here
+            stack = inspect.stack()
+            file, line = "Unknown", 0
+            for frame in stack:
+                if "django" in frame.filename or "site-packages" in frame.filename:
+                    continue
+                file, line = frame.filename, frame.lineno
+                break
 
-            # Mark this queryset as active
-            active_queryset = qs_id
+            group_key = (file, line)
+            active_queryset = group_key
 
             try:
                 for obj in original_iter(self):
                     yield obj
             finally:
                 active_queryset = None
-
 
         def patched_fetch_all(self):
             qs_id = id(self)
@@ -219,19 +226,29 @@ def track_orm_cost(view_func):
             result = original_fetch_all(self)
             q_end = len(connection.queries)
 
-            # Determine logical owner
-            owner_id = active_queryset if active_queryset else qs_id
+            # ── NEW: if we're inside an active iteration, attach to its group ──
+            if active_queryset is not None and active_queryset in queryset_groups:
+                parent_group = queryset_groups[active_queryset]
+                for idx in range(q_start, q_end):
+                    parent_group["queries"].append(idx)
+                    # Tag these as "child" queries so we can flag N+1 later
+                    parent_group.setdefault("child_queries", set()).add(idx)
+                return result
+            # ───────────────────────────────────────────────────────────────────
 
-            if owner_id not in queryset_groups:
-                queryset_groups[owner_id] = {
+            group_key = (file, line)
+
+            if group_key not in queryset_groups:
+                queryset_groups[group_key] = {
                     "origin": (file, line),
                     "queries": [],
-                    "model": model_name
+                    "model": model_name,
+                    "child_queries": set()
                 }
-                queryset_order.append(owner_id)
+                queryset_order.append(group_key)
 
             for idx in range(q_start, q_end):
-                queryset_groups[owner_id]["queries"].append(idx)
+                queryset_groups[group_key]["queries"].append(idx)
 
             return result
         
