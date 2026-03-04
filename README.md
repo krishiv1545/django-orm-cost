@@ -15,12 +15,12 @@ The tool is designed to be wrapped around any Django view (function-based or met
 git clone https://github.com/krishiv1545/django-orm-cost
 ```
 
-### 2. Install within your project
+### 2. Install within your project env
 ```bash
 pip install -e /path/to/django-orm-cost
 ```
 
-### 3. Add the following to your settings.py
+### 3. Add following to INSTALLED_APPS in your Django's settings.py
 ```python
 "django_orm_cost.apps.DjangoOrmCostConfig"
 ```
