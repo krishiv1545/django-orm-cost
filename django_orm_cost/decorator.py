@@ -32,6 +32,7 @@ GOLD = "\033[38;5;220m"        # Gold
 WHITE = "\033[38;5;255m"       # White
 GRAY = "\033[38;5;244m"        # Gray
 CRIMSON = "\033[38;5;196m"     # Red
+SUNSET = "\033[38;5;202m"      # Orange
 RESET = "\033[0m"
 
 
@@ -428,14 +429,45 @@ def track_orm_cost(view_func):
             print(f"   {LIME}Efficiency = {len(consumed_name_set)}/{len(fetched_name_set)} | {efficiency_pct:.2f}% over-fetched{RESET}")
 
             is_n1 = False
-            if len(q_indices) > 1:
+            n1_type = None  # 'lazy_fk' or 'loop_query'
+            if consumed_name_set and len(q_indices) > 1:
                 fingerprints = [
                     normalize_sql(view_queries[q_idx - start_queries]["sql"])
                     for q_idx in q_indices
                 ]
                 if len(set(fingerprints)) < len(fingerprints):
                     is_n1 = True
-                    print(f"   {CRIMSON}>>> N+1 detected inside this QuerySet{RESET}")
+                    # Detect type: if repeated SQLs query a DIFFERENT table than the group model,
+                    # it's an explicit loop query. If same table, it's a lazy FK lookup.
+                    repeated_fp = [fp for fp in set(fingerprints) if fingerprints.count(fp) > 1]
+                    first_repeated_sql = next(
+                        view_queries[q_idx - start_queries]["sql"]
+                        for q_idx in q_indices
+                        if normalize_sql(view_queries[q_idx - start_queries]["sql"]) == repeated_fp[0]
+                    )
+                    # Extract the table name from the repeated SQL's FROM clause
+                    table_match = re.search(r'FROM\s+"?(\w+)"?', first_repeated_sql, re.IGNORECASE)
+                    repeated_table = table_match.group(1) if table_match else ""
+                    # Compare against the group's own model table
+                    group_table = model_name.lower().replace(" ", "")  # rough match
+                    if repeated_table.lower().replace("_", "") != group_table:
+                        n1_type = 'loop_query'
+                    else:
+                        n1_type = 'lazy_fk'
+
+            if is_n1:
+                if n1_type == 'loop_query':
+                    print(
+                        f"   {CRIMSON}>>> N+1 Query Detected{RESET}\n"
+                        f"   {CRIMSON}The same database query is being executed multiple times inside a loop.{RESET}\n"
+                        f"   {CRIMSON}This usually happens when querying the database for each item individually.{RESET}"
+                    )
+                else:
+                    print(
+                        f"   {CRIMSON}>>> N+1 Query Detected{RESET}\n"
+                        f"   {CRIMSON}Related objects are being fetched one-by-one from the database.{RESET}\n"
+                        f"   {CRIMSON}This happens when Django lazily loads ForeignKey relationships.{RESET}\n"
+                    )
 
             if efficiency_pct > 0:
                 sugg = suggest(list(fetched_name_set), list(consumed_name_set), tracker, safe_instance_ids, qs_id, model_name, is_n1)
