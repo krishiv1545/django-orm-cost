@@ -368,7 +368,15 @@ def track_orm_cost(view_func):
                 raw_sql = view_queries[q_idx - start_queries]["sql"]
 
                 # Normalize numeric values to detect repetition
-                fingerprint = re.sub(r"\b\d+\b", "?", raw_sql)
+                def normalize_sql(sql):
+                    # Normalize standalone integers
+                    sql = re.sub(r"\b\d+\b", "?", sql)
+                    # Normalize UUIDs (hex strings with optional hyphens inside quotes)
+                    sql = re.sub(r"'[0-9a-f]{8}[0-9a-f\-]{0,27}'", "'?'", sql, flags=re.IGNORECASE)
+                    # Normalize any remaining quoted strings (catches other id formats)
+                    sql = re.sub(r"'[^']{8,}'", "'?'", sql)
+                    return sql
+                fingerprint = normalize_sql(raw_sql)
 
                 if fingerprint not in sql_counter:
                     sql_counter[fingerprint] = {
@@ -393,7 +401,7 @@ def track_orm_cost(view_func):
             is_n1 = False
             if efficiency_pct > 0:
                 fingerprints = [
-                    re.sub(r"\b\d+\b", "?", view_queries[q_idx - start_queries]["sql"])
+                    normalize_sql(view_queries[q_idx - start_queries]["sql"])
                     for q_idx in q_indices
                 ]
                 if len(set(fingerprints)) < len(fingerprints):
