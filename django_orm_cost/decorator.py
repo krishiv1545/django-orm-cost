@@ -114,20 +114,53 @@ def extract_fields_from_sql(sql):
 def filter_id(fields):
     return [
         f for f in fields
+        if f != "id"
+    ]
+
+
+def c_filter_id(fields):
+    return [
+        f for f in fields
         if f != "id" and not f.endswith("_id")
     ]
 
 
 def f_filter_id(fields):
     f_clean = [f.split('.')[-1] for f in fields]
-    return filter_id(f_clean)
+    return [
+        f for f in f_clean
+        if f != "id" and not f.endswith("_id")
+    ]
 
 
-def suggest(fetched, consumed):
+def suggest(fetched, consumed, tracker, all_instance_ids, qs_id, model_name="Model", is_n1=False):
+    if not consumed:
+        return f"{model_name}.objects.none()"
 
-    if len(fetched) == len(consumed):
-        return None
-    sugg = f".only({', '.join(repr(f) for f in sorted(consumed))})"
+    # 1. Categorize fields
+    local_fields = sorted([f for f in consumed if "__" not in f])
+    related_paths = sorted([f for f in consumed if "__" in f])
+    
+    # Identify the top-level relations (e.g., 'reviewer' from 'reviewer__first_name')
+    relations = sorted(list({p.split('__')[0] for p in related_paths}))
+
+    # 2. Build ORM components
+    # If N+1 is detected, we MUST suggest select_related to fix the loop
+    # If no N+1 but we have related paths, it's likely already select_related or needs to be
+    
+    method_chain = [f"{model_name}.objects"]
+    
+    if relations:
+        # For simplicity in this tracker, we treat related field access 
+        # as a candidate for select_related to flatten the query
+        rel_args = ", ".join(repr(r) for r in relations)
+        method_chain.append(f"select_related({rel_args})")
+
+    # .only() should contain both local fields and the specific related paths
+    only_args = [repr(f) for f in local_fields + related_paths]
+    method_chain.append(f"only({', '.join(only_args)})")
+
+    sugg = ".".join(method_chain)
     return sugg
 
 
@@ -158,6 +191,7 @@ def track_orm_cost(view_func):
 
         def patched_fetch_all(self):
             qs_id = id(self)
+            model_name = self.model.__name__
 
             stack = inspect.stack()
             file, line = "Unknown", 0
@@ -191,7 +225,8 @@ def track_orm_cost(view_func):
             if owner_id not in queryset_groups:
                 queryset_groups[owner_id] = {
                     "origin": (file, line),
-                    "queries": []
+                    "queries": [],
+                    "model": model_name
                 }
                 queryset_order.append(owner_id)
 
@@ -241,6 +276,7 @@ def track_orm_cost(view_func):
         for qs_id in queryset_order:
 
             group = queryset_groups[qs_id]
+            model_name = group["model"]
 
             origin = group["origin"]
             q_indices = [
@@ -295,7 +331,7 @@ def track_orm_cost(view_func):
                 if fingerprint not in sql_counter:
                     sql_counter[fingerprint] = {
                         "count": 0,
-                        "preview": raw_sql[:120]
+                        "sql_ast": raw_sql
                     }
 
                 sql_counter[fingerprint]["count"] += 1
@@ -303,26 +339,29 @@ def track_orm_cost(view_func):
             # Print aggregated SQLs
             for i, (fp, data) in enumerate(sql_counter.items(), 1):
                 count = data["count"]
-                preview = data["preview"]
+                sql_ast = data["sql_ast"]
 
                 prefix = f"[{count}x] " if count > 1 else ""
-                print(f"   {SKY}SQL {i}: {prefix}{preview}...{RESET}")
+                print(f"   {SKY}SQL {i}: {prefix}{sql_ast}{RESET}")
 
             print(f"   {GOLD}Fields Fetched  = {pretty_fields}{RESET}")
-            print(f"   {LIME}Fields Consumed = {sorted(list(c_clean))}{RESET}")
-            print(f"   {LIME}Efficiency = {len(c_clean)}/{len(pretty_fields)} | {100 - (len(c_clean) / len(pretty_fields) * 100):.2f}% over-fetched{RESET}")
+            print(f"   {LIME}Fields Consumed = {c_filter_id(c_clean)}{RESET}")
+            print(f"   {LIME}Efficiency = {len(c_filter_id(c_clean))}/{len(pretty_fields)} | {100 - (len(c_filter_id(c_clean)) / len(pretty_fields) * 100):.2f}% over-fetched{RESET}")
 
+            is_n1 = False
             if len(q_indices) > 1:
                 fingerprints = [
                     re.sub(r"\b\d+\b", "?", view_queries[q_idx - start_queries]["sql"])
                     for q_idx in q_indices
                 ]
                 if len(set(fingerprints)) < len(fingerprints):
+                    is_n1 = True
                     print(f"   {CRIMSON}>>> N+1 detected inside this QuerySet{RESET}")
 
-            sugg = suggest(f_clean, c_clean)
-            if sugg:
-                print(f"   {WHITE}>>> Suggestion: {sugg}{RESET}")
+            if (100 - (len(c_clean) / len(pretty_fields) * 100)) > 0:
+                sugg = suggest(f_clean, c_clean, tracker, all_instance_ids, qs_id, model_name, is_n1)
+                if sugg:
+                    print(f"   {WHITE}>>> Suggestion: {sugg}{RESET}")
 
             logical_count += 1
         print("")
