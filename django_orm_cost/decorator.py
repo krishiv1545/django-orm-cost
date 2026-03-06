@@ -43,6 +43,7 @@ RESET = "\033[0m"
 # 2. Instance ID* -> Accessed field Paths (e.g. "user__email") // from patched __getattribute__, 
 # 3. Instance ID* -> Relation Path-Prefix (e.g. "user__") // from patched __getattribute__, 
 #                                                           when we access a related field, we track the lineage of that relationship
+# 4. Instance ID* -> Model Class Name // from patched __getattribute__
 # *IDs are Python memory addresses/IDs (e.g, id(instance))
 class FieldUsageTracker:
     def __init__(self):
@@ -63,38 +64,48 @@ class FieldUsageTracker:
     # This function patches the __getattribute__ method of every model
     # (original) user.username -> user.__getattribute__("username")
     # (patched) user.username -> patched_getattribute(user, "username")
+
+
     def patch_model(self, model):
-        if model in self._patched_models: return
+        if model in self._patched_models: 
+            return
         original_getattribute = model.__getattribute__
         tracker = self
+
 
         def patched_getattribute(instance, name):
             instance_id = id(instance)
             try:
+                # meta holds all fields of the model
                 meta = object.__getattribute__(instance, "_meta")
+                # student.username -> meta.get_field("username")
+                # student.<method_name> -> wont be found in meta, goes to exception
+                # this is how we filter out non-field attributes and only track database fields
                 field = meta.get_field(name)
 
-                # Track relationship lineage
+                # triggered when field access triggers a DB lookup for a related object
                 if field.is_relation and not name.endswith('_id'):
                     related_obj = original_getattribute(instance, name)
                     if related_obj:
-                        prefix = tracker.instance_to_path.get(instance_id, "")
-                        tracker.instance_to_path[id(related_obj)] = f"{prefix}{name}__"
+                        # if triggered when you run 'student.teacher'
+                        prefix = tracker.instance_to_path.get(instance_id, "") # prefix is full path to current instance (e.g, student__)
+                        tracker.instance_to_path[id(related_obj)] = f"{prefix}{name}__" # id(teacher instance) -> student__teacher__
                     return related_obj
 
-                # Track data usage
                 if name in {f.name for f in meta.fields}:
-                    prefix = tracker.instance_to_path.get(instance_id, "")
-                    tracker.used_fields.setdefault(instance_id, set()).add(f"{prefix}{name}")
+                    prefix = tracker.instance_to_path.get(instance_id, "") # If instance is 'student', prefix would be student__ in 'instance_to_path'
+                    tracker.used_fields.setdefault(instance_id, set()).add(f"{prefix}{name}") # if field 'username' is fetched, add 'student__username' to used_fields
             except Exception: 
                 pass
             # call original getattribute to ensure normal behavior
-            # user.username -> patched_getattribute(user, "username") // track data usage -> original_getattribute(user, "username")
+            # user.username -> patched_getattribute(user, "username") -> track data usage -> original_getattribute(user, "username")
             return original_getattribute(instance, name)
 
         model.__getattribute__ = patched_getattribute # overiding getattribute of model with patched version
         self._patched_models[model] = original_getattribute
 
+
+    # Linking created instances back to the query that created them, using post_init signal
     def record_creation(self, sender, instance, **kwargs):
         query_idx = len(connection.queries) - 1
         inst_id = id(instance)
@@ -190,15 +201,20 @@ def suggest(fetched, consumed, tracker, all_instance_ids, qs_id, model_name="Mod
 # Decorator to wrap Django view
 def track_orm_cost(view_func):
     @wraps(view_func)
-    def wrapper(request, *args, **kwargs):
+    def wrapper(request, *args, **kwargs): 
+        # *args = positional arguments (1, "f1"), **kwargs = keyword arguments (number=1, name="f1")
+        # args becomes a tuple (1, "f1"), kwargs becomes a dict {"number": 1, "name": "f1"}
         tracker = FieldUsageTracker()
 
         active_queryset = None
         queryset_groups = {}
         queryset_order = []
 
+        # patched_iter exists to group N+1 under parent query
+        # When QS are executed within a for loop, QuerrySet.__iter__
+        # We monkey-patch __iter__ to detect the file and line number of the loop
         def patched_iter(self):
-            nonlocal active_queryset
+            nonlocal active_queryset # nearest enclosing scope (nearest outside of patched_iter)
 
             stack = inspect.stack()
             file, line = "Unknown", 0
@@ -209,16 +225,18 @@ def track_orm_cost(view_func):
                 break
 
             group_key = (file, line)
-            
-            # Set active_queryset BEFORE the group exists, just store the key
-            # patched_fetch_all will check if active_queryset is set, and if the group
-            # exists. If not yet created, it will create it then attach child queries.
             active_queryset = group_key
-
+            # This sets a flag that any QuerySet fetches triggered during this iteration will be grouped under this file:line key,
+            # allowing us to group parent and child queries together for N+1 detection and analysis. 
+            # The flag is cleared after the loop finishes.
+            # (e.g, for student in students: -> active_queryset = ("students.py", 1008) -> 
+            # student.teacher triggers a fetch with active_queryset = ("students.py", 1008) -> 
+            # we know this fetch is a child query of the loop at students.py:1008)
             try:
                 for obj in original_iter(self):
                     yield obj
             finally:
+                # Clear the flag after iteration completes, to avoid grouping unrelated queries under the same file:line key
                 active_queryset = None
 
         def patched_fetch_all(self):
@@ -273,7 +291,7 @@ def track_orm_cost(view_func):
                     parent_group["child_queries"].add(idx)
                 return result
 
-            # Normal path: this fetch is the parent QuerySet itself
+            # this fetch is the parent QuerySet itself
             if group_key not in queryset_groups:
                 queryset_groups[group_key] = {
                     "origin": (file, line),
@@ -329,12 +347,21 @@ def track_orm_cost(view_func):
         for qs_id in queryset_order:
 
             group = queryset_groups[qs_id]
-            model_name = group["model"]
+            # print(f"group: {group}")
+            # group: {
+            #   'origin': ('D:\\Projects\\finnovate_project\\fintech_project\\core_APP\\modules\\gl_reviews\\gl_reviews.py', 1015), 
+            #   'queries': [3, 4, 5, 6], 
+            #   'model': 'ReviewTrail', 
+            #   'child_queries': {4, 5, 6}
+            # }
 
+            model_name = group["model"]
             origin = group["origin"]
+
             q_indices = [
                 idx for idx in group["queries"]
-                if start_queries <= idx < end_queries
+                if start_queries <= idx < end_queries # filter out queries that were executed outside of this view 
+                # Technically, queries cannot have indices outside of the view's range, but whatever~
             ]
 
             if not q_indices:
@@ -348,7 +375,7 @@ def track_orm_cost(view_func):
                 local_idx = q_idx - start_queries
                 q = view_queries[local_idx]
 
-                sql_previews.append(q["sql"][:120])
+                sql_previews.append(q["sql"])
 
                 inst_ids = tracker.query_to_instances.get(q_idx, set())
                 all_instance_ids.update(inst_ids)
@@ -356,12 +383,12 @@ def track_orm_cost(view_func):
                 all_fetched_raw += extract_fields_from_sql(q["sql"])
 
             # Filter out instance IDs whose memory address has been reused by a
-            # different model (Python GC recycles addresses after short-lived .first()
-            # calls). We keep an instance if:
-            # (a) its recorded model matches this group's model, OR
-            # (b) it has a path prefix in instance_to_path, meaning it's a related
-            #     object loaded via select_related (e.g. CustomUser joined into
-            #     ResponsibilityMatrix) — these legitimately have a different model name
+            # different model (Python GC recycles addresses after short-lived .first() calls)
+            # We keep an instance if:
+            # 1. its recorded model matches this group's model, OR
+            # 2. it has a path prefix in instance_to_path, meaning 
+            #    it's a related object loaded via select_related (e.g. CustomUser joined into ResponsibilityMatrix)
+            #    these legitimately have a different model name
             safe_instance_ids = set()
             for obj_id in all_instance_ids:
                 recorded_model = tracker.instance_to_model.get(obj_id)
