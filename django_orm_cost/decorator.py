@@ -420,11 +420,11 @@ def track_orm_cost(view_func):
 
             # For display, pretty_fields stays the same (shows [Nx] multipliers)
             # But efficiency is calculated on unique field name sets
-            fetched_name_set = set(unique_fetched)
-            consumed_name_set = set(c_filter_id(c_clean))
+            fetched_name_list = f_clean
+            consumed_name_list = c_filter_id(c_clean)
 
-            over_fetched_count = len(fetched_name_set - consumed_name_set)
-            efficiency_pct = (over_fetched_count / len(fetched_name_set) * 100) if fetched_name_set else 0.0
+            over_fetched_count = len(fetched_name_list) - len(consumed_name_list)
+            efficiency_pct = (over_fetched_count / len(fetched_name_list) * 100) if fetched_name_list else 0.0
 
             print(f"\n{BOLD}{SKY}{logical_count}. QuerySet Analysis{RESET}")
             print(f"   {GRAY}Location: {origin[0]}:{origin[1]}{RESET}")
@@ -452,12 +452,12 @@ def track_orm_cost(view_func):
                 print(f"   {SKY}SQL {i}: {prefix}{sql_ast}{RESET}")
 
             print(f"   {GOLD}Fields Fetched  = {pretty_fields}{RESET}")
-            print(f"   {LIME}Fields Consumed = {sorted(consumed_name_set)}{RESET}")
-            print(f"   {LIME}Efficiency = {len(consumed_name_set)}/{len(fetched_name_set)} | {efficiency_pct:.2f}% over-fetched{RESET}")
+            print(f"   {LIME}Fields Consumed = {sorted(consumed_name_list)}{RESET}")
+            print(f"   {LIME}Efficiency = {len(consumed_name_list)}/{len(fetched_name_list)} | {efficiency_pct:.2f}% over-fetched{RESET}")
 
             is_n1 = False
             n1_type = None  # 'lazy_fk' or 'loop_query'
-            if consumed_name_set and len(q_indices) > 1:
+            if consumed_name_list and len(q_indices) > 1:
                 fingerprints = [
                     normalize_sql(view_queries[q_idx - start_queries]["sql"])
                     for q_idx in q_indices
@@ -497,7 +497,7 @@ def track_orm_cost(view_func):
                     )
 
             if efficiency_pct > 0:
-                sugg = suggest(list(fetched_name_set), list(consumed_name_set), tracker, safe_instance_ids, qs_id, model_name, is_n1)
+                sugg = suggest(list(fetched_name_list), list(consumed_name_list), tracker, safe_instance_ids, qs_id, model_name, is_n1)
                 if sugg:
                     print(f"   {WHITE}>>> Suggestion: {sugg}{RESET}")
 
