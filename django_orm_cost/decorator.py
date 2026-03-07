@@ -81,10 +81,19 @@ class FieldUsageTracker:
                 # student.username -> meta.get_field("username")
                 # student.<method_name> -> wont be found in meta, goes to exception
                 # this is how we filter out non-field attributes and only track database fields
+
+                # attname = attribute name; student.teacher.id is caught
+                # but student.teacher_id is considered an attribute name
+                attname_to_field = {f.attname: f for f in meta.fields if hasattr(f, 'attname')}
+                if name in attname_to_field:
+                    prefix = tracker.instance_to_path.get(instance_id, "")
+                    tracker.used_fields.setdefault(instance_id, set()).add(f"{prefix}{name}")
+                    return original_getattribute(instance, name)
+        
                 field = meta.get_field(name)
 
                 # triggered when field access triggers a DB lookup for a related object
-                if field.is_relation and not name.endswith('_id'):
+                if field.is_relation:
                     related_obj = original_getattribute(instance, name)
                     if related_obj:
                         # if triggered when you run 'student.teacher'
@@ -152,18 +161,11 @@ def filter_id(fields):
     ]
 
 
-def c_filter_id(fields):
-    return [
-        f for f in fields
-        if f != "id" and not f.endswith("_id")
-    ]
-
-
 def f_filter_id(fields):
     f_clean = [f.split('.')[-1] for f in fields]
     return [
         f for f in f_clean
-        if f != "id" and not f.endswith("_id")
+        if f != "id"
     ]
 
 
@@ -414,14 +416,10 @@ def track_orm_cost(view_func):
                     pretty_fields.append(field.split('.')[-1])
             c_clean = filter_id(consumed_paths)
 
-            # use unique field NAMES for both sides of the efficiency ratio
-            unique_fetched = list(field_counts.keys())                # deduplicated field names
-            unique_consumed = c_filter_id(filter_id(consumed_paths))  # deduplicated consumed
-
             # For display, pretty_fields stays the same (shows [Nx] multipliers)
             # But efficiency is calculated on unique field name sets
             fetched_name_list = f_clean
-            consumed_name_list = c_filter_id(c_clean)
+            consumed_name_list = filter_id(c_clean)
 
             over_fetched_count = len(fetched_name_list) - len(consumed_name_list)
             efficiency_pct = (over_fetched_count / len(fetched_name_list) * 100) if fetched_name_list else 0.0
