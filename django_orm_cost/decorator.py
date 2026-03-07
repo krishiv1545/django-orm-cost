@@ -99,6 +99,13 @@ class FieldUsageTracker:
                         # if triggered when you run 'student.teacher'
                         prefix = tracker.instance_to_path.get(instance_id, "") # prefix is full path to current instance (e.g, student__)
                         tracker.instance_to_path[id(related_obj)] = f"{prefix}{name}__" # id(teacher instance) -> student__teacher__
+
+                        # 'student.teacher.first_name'
+                        # Django's FK descriptor is a function that returns a related object using foreign key to form a JOIN
+                        # Thus, 'teacher_id' is also consumed without directly using 'student.teacher_id' attname
+                        # This is to count access to 'teacher_id' in consumed fields
+                        if hasattr(field, 'attname'):
+                            tracker.used_fields.setdefault(instance_id, set()).add(f"{prefix}{name}")
                     return related_obj
 
                 if name in {f.name for f in meta.fields}:
