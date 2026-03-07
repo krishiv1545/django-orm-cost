@@ -8,6 +8,11 @@ To identify and eliminate **Over-fetching** (fetching columns you don't use) and
 ## The Decorator: `@track_orm_cost`
 The tool is designed to be wrapped around any Django view (function-based or method-based). Once applied, it automatically instruments the request cycle to profile DB performance.
 
+## The Middleware: `ORMCostMiddleware`
+Automatically applies `track_orm_cost` to every view in your project without touching view code. Supports include/exclude glob patterns for scoped profiling.
+
+---
+
 ## Installation
 
 ### 1. Clone this repository
@@ -20,15 +25,9 @@ git clone https://github.com/krishiv1545/django-orm-cost
 pip install -e /path/to/django-orm-cost
 ```
 
-### 3. Add following to INSTALLED_APPS in your Django's settings.py
+### 3 (a). Import and use @track_orm_cost
 ```python
-"django_orm_cost.apps.DjangoOrmCostConfig"
-```
-
-### 4. Import and use @track_orm_cost
-
-```python
-from django_orm_cost.decorator import track_orm_cost
+from django_orm_cost import track_orm_cost
 
 @login_required
 @track_orm_cost
@@ -36,6 +35,37 @@ def my_view(request):
     # Your logic here
     return render(request, 'template.html') # or RESTful response
 ```
+
+### 3 (b). Use ORMCostMiddleware
+
+Add to `settings.py`:
+
+```python
+MIDDLEWARE = [
+    # ... your existing middleware ...
+    "django_orm_cost.middleware.ORMCostMiddleware",
+]
+
+# Default: False
+ORM_COST_DEBUG_ONLY = True
+
+# Optional whitelisting to include modules and/or files
+# Default: All
+ORM_COST_INCLUDE = [
+    "*/invoices/*",
+    "*/invoices/views.py",
+]
+
+# Optional blacklisting to exclude modules and/or files
+# Default: None
+ORM_COST_EXCLUDE = [
+    "django.contrib.admin.*",
+    "*/invoices/*",
+    "*/invoices/views.py",
+]
+```
+
+---
 
 ## Core Concepts
 
@@ -50,21 +80,25 @@ Django maintains a `connection.queries` log when `DEBUG` is enabled. This tool h
 
 ### 2. Lazy QuerySets & Call Site Resolution
 QuerySets are lazy; they are often defined in one place but evaluated elsewhere. The tracker inspects the Python call stack at the moment of execution, skipping Django internals and `site-packages` frames, to find the exact line in your project code that triggered the database hit.
-* **SQL Executed At:** This identifies the exact line in your project where the database was actually hit. 
+* **SQL Executed At:** This identifies the exact line in your project where the database was actually hit.
 * **The Mechanism:** We patch `QuerySet._fetch_all` to capture the call stack at the moment of evaluation, filtering out Django internals to find your project's business logic.
 
 ### 3. Field Usage Tracking
-The tracker monkey-patches `__getattribute__` on every registered Django model for the duration of the request. Every field access on a model instance is intercepted and recorded against that instance's memory address. This produces a map of which fields your code actually touched after the query returned. Example of monkey-patching:-
-```
-class MyClass:
-    def __getattribute__(self, name):
-        print(f"Accessing: {name}")
-        return super().__getattribute__(name)
-```
+The tracker monkey-patches `__getattribute__` on every registered Django model for the duration of the request. Every field access on a model instance is intercepted and recorded against that instance's memory address. This produces a map of which fields your code actually touched after the query returned.
 
-### 4. N+1 Classification
+Three categories of field access are tracked:
+
+* **Direct fields** — e.g. `trail.action`: caught by checking the field name against `meta.fields`.
+* **FK attnames** — e.g. `trail.reviewer_id`: caught via an `attname` map built from `meta.fields`, since `meta.get_field("reviewer_id")` raises `FieldDoesNotExist` in Django.
+* **Relation traversals** — e.g. `trail.reviewer.first_name`: when a relation field is accessed, the FK attname (e.g. `reviewer_id`) is recorded as consumed on the parent instance, and a path prefix (e.g. `reviewer__`) is stamped onto the related object so subsequent field accesses on it are recorded with their full path (e.g. `reviewer__first_name`).
+
+### 4. Iterator Patching & N+1 Grouping
+`QuerySet.__iter__` is patched to detect when a QuerySet is being iterated in a `for` loop. At that moment, the file and line number of the loop are captured and set as the **active group key**. Any QuerySet that fires *during* that iteration from a *different* call site is classified as a child query and grouped under the parent loop — this is how N+1 queries are detected and attributed to their origin loop rather than reported as independent QuerySets.
+
+### 5. N+1 Classification
 - **Loop query** — The same database query is being executed multiple times inside a loop. This usually happens when querying the database for each item individually.
 - **Lazy FK** — Related objects are being fetched one-by-one from the database. This happens when Django lazily loads ForeignKey relationships.
+
 ---
 
 ## Log Analysis Guide
