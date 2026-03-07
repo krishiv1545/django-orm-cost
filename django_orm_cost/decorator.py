@@ -105,7 +105,7 @@ class FieldUsageTracker:
                         # Thus, 'teacher_id' is also consumed without directly using 'student.teacher_id' attname
                         # This is to count access to 'teacher_id' in consumed fields
                         if hasattr(field, 'attname'):
-                            tracker.used_fields.setdefault(instance_id, set()).add(f"{prefix}{name}")
+                            tracker.used_fields.setdefault(instance_id, set()).add(f"{prefix}{field.attname}") # maybe f"{prefix}{name}"
                     return related_obj
 
                 if name in {f.name for f in meta.fields}:
